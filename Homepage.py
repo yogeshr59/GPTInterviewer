@@ -1,88 +1,195 @@
+from dataclasses import dataclass
 import streamlit as st
-from streamlit_option_menu import option_menu
-from app_utils import switch_page
-import streamlit as st
+from speech_recognition.openai_whisper import save_wav_file, transcribe
+from audio_recorder_streamlit import audio_recorder
+from langchain.callbacks import get_openai_callback
+from langchain.chat_models import ChatOpenAI
+from langchain.memory import ConversationBufferMemory
+from langchain.chains import RetrievalQA, ConversationChain
+from langchain.prompts.prompt import PromptTemplate
+from prompts.prompts import templates
+from typing import Literal
+from aws.synthesize_speech import synthesize_speech
+from langchain.embeddings import OpenAIEmbeddings
+from langchain.vectorstores import FAISS
+from langchain.text_splitter import NLTKTextSplitter
+from PyPDF2 import PdfReader
+from prompts.prompt_selector import prompt_sector
+from streamlit_lottie import st_lottie
+import json
+from IPython.display import Audio
+import nltk
 from PIL import Image
 
-mn=Image.open("AI.webp")
-st.set_page_config(page_title = "AI Interviewer", layout = "centered",page_icon=mn)
-if True:
-    home_title = "AI Interviewer"
-    home_introduction = "Welcome to AI Interviewer, empowering your interview preparation with generative AI."
-    with st.sidebar:
-        st.markdown('## AI Interviewer')
-        st.markdown('## Team : Mission-255')
-        st.markdown(""" 
-        #### Contact Us:
-        [Aagam Shah](https://www.linkedin.com/in/aagamshah08)
-       
-        [Sai Praneeth konuri](https://www.linkedin.com/in/sai-praneeth-konuri)
-                    
-        [Sri Vinay Appari](https://www.linkedin.com/in/SriVinayA)
-                    """)
-    st.markdown(
-        "<style>#MainMenu{visibility:hidden;}</style>",
-        unsafe_allow_html=True
-    )
+st.markdown(f"""# Welcome to Resume Interview!""",unsafe_allow_html=True)
+st.markdown("""\n""")
+position = st.selectbox("Select the position that you are applying to", ["Software Engineer","Data Scientist", "Data Engineer", "Data Analyst","Full Stack Developer","Frontend Developer","Backend Developer","Cloud Engineer","DevOps Engineer","Database Administrator","Application Developer","Quality Assurance Engineer"])
+resume = st.file_uploader("Please Upload your resume", type=["pdf"])
+auto_play = st.checkbox("Check this box, If you want AI interviewer to speak! (Please don't change during the interview)")
 
-    col1, col2, col3= st.columns([1,7,1])
+@dataclass
+class Message:
+    """Class to keep track of interview history."""
+    origin: Literal["human", "ai"]
+    message: str
 
+def save_vector(resume):
+    """embeddings"""
+    nltk.download('punkt')
+    pdf_reader = PdfReader(resume)
+    text = ""
+    for page in pdf_reader.pages:
+        text += page.extract_text()
+    # Split the document into chunks
+    text_splitter = NLTKTextSplitter()
+    texts = text_splitter.split_text(text)
+
+    embeddings = OpenAIEmbeddings()
+    docsearch = FAISS.from_texts(texts, embeddings)
+    return docsearch
+
+def initialize_session_state_resume():
+    # convert resume to embeddings
+    if 'docsearch' not in st.session_state:
+        st.session_state.docsearch = save_vector(resume)
+    # retriever for resume screen
+    if 'retriever' not in st.session_state:
+        st.session_state.retriever = st.session_state.docsearch.as_retriever(search_type="similarity")
+    # prompt for retrieving information
+    if 'chain_type_kwargs' not in st.session_state:
+        st.session_state.chain_type_kwargs = prompt_sector(position, templates)
+    # interview history
+    if "resume_history" not in st.session_state:
+        st.session_state.resume_history = []
+        st.session_state.resume_history.append(Message(origin="ai", message="Hello! I will be interviewing you today. I'll be asking you a set of questions based on your resume. Okay, let's get going! Would you kindly introduce yourself or say hello first?. Note: You may only answer with a maximum length of 4097 tokens!"))
+    # token count
+    if "token_count" not in st.session_state:
+        st.session_state.token_count = 0
+    # memory buffer for resume screen
+    if "resume_memory" not in st.session_state:
+        st.session_state.resume_memory = ConversationBufferMemory(human_prefix = "Candidate: ", ai_prefix = "Interviewer")
+    # guideline for resume screen
+    if "resume_guideline" not in st.session_state:
+        llm = ChatOpenAI(
+        model_name = "gpt-4-1106-preview",
+        temperature = 0.5)
+
+        st.session_state.resume_guideline = RetrievalQA.from_chain_type(
+            llm=llm,
+            chain_type_kwargs=st.session_state.chain_type_kwargs, chain_type='stuff',
+            retriever=st.session_state.retriever, memory = st.session_state.resume_memory).run("Create an interview guideline and prepare only two questions for each topic. Make sure the questions tests the knowledge")
+    # llm chain for resume screen
+    if "resume_screen" not in st.session_state:
+        llm = ChatOpenAI(
+            model_name="gpt-4-1106-preview",
+            temperature=0.7)
+
+        PROMPT = PromptTemplate(
+            input_variables=["history", "input"],
+            template= """I want you to act as an interviewer strictly following the guideline in the current conversation.
+            
+            Ask me questions and wait for my answers like a human. Do not write explanations.
+            Candidate has no assess to the guideline.
+            Only ask one question at a time. 
+            Do ask follow-up questions if you think it's necessary.
+            Do not ask the same question.
+            Do not repeat the question.
+            Candidate has no assess to the guideline.
+            You name is AI-Interviewer.
+            I want you to only reply as an interviewer.
+            Do not write all the conversation at once.
+            Candiate has no assess to the guideline.
+            
+            Current Conversation:
+            {history}
+            
+            Candidate: {input}
+            AI: """)
+        st.session_state.resume_screen =  ConversationChain(prompt=PROMPT, llm = llm, memory = st.session_state.resume_memory)
+    # llm chain for generating feedback
+    if "resume_feedback" not in st.session_state:
+        llm = ChatOpenAI(
+            model_name="gpt-4-1106-preview",
+            temperature=0.5)
+        st.session_state.resume_feedback = ConversationChain(
+            prompt=PromptTemplate(input_variables=["history","input"], template=templates.feedback_template),
+            llm=llm,
+            memory=st.session_state.resume_memory,
+        )
+
+def answer_call_back():
+    with get_openai_callback() as cb:
+        human_answer = st.session_state.answer
+        if voice:
+            save_wav_file("temp/audio.wav", human_answer)
+            try:
+                input = transcribe("temp/audio.wav")
+            except:
+                st.session_state.resume_history.append(Message("ai", "Sorry, I didn't get that."))
+                return "Please try again."
+        else:
+            input = human_answer
+        st.session_state.resume_history.append(
+            Message("human", input)
+        )
+        # OpenAI answer and save to history
+        llm_answer = st.session_state.resume_screen.run(input)
+        # speech synthesis and speak out
+        audio_file_path = synthesize_speech(llm_answer)
+        # create audio widget with autoplay
+        audio_widget = Audio(audio_file_path, autoplay=True)
+        # save audio data to history
+        st.session_state.resume_history.append(
+            Message("ai", llm_answer)
+        )
+        st.session_state.token_count += cb.total_tokens
+        return audio_widget
+
+if position and resume:
+    # intialize session state
+    initialize_session_state_resume()
+    credit_card_placeholder = st.empty()
+    col1, col2 = st.columns(2)
     with col1:
-        st.write("")
-
+        feedback = st.button("Get Interview Feedback")
     with col2:
-        st.image(mn, width=500)
+        guideline = st.button("Show me interview guideline!")
+    chat_placeholder = st.container()
+    answer_placeholder = st.container()
+    audio = None
+    # if submit email adress, get interview feedback imediately
+    if guideline:
+        st.markdown(st.session_state.resume_guideline)
+    if feedback:
+        evaluation = st.session_state.resume_feedback.run("please give evalution regarding the interview")
+        st.markdown(evaluation)
+        st.download_button(label="Download Interview Feedback", data=evaluation, file_name="interview_feedback.txt")
+        st.stop()
+    else:
+        with answer_placeholder:
+            voice: bool = st.checkbox("I would like to speak with AI Interviewer!")
+            if voice:
+                answer = audio_recorder(pause_threshold=2, sample_rate=44100)
+                #st.warning("An UnboundLocalError will occur if the microphone fails to record.")
+            else:
+                answer = st.chat_input("Your answer")
+            if answer:
+                st.session_state['answer'] = answer
+                audio = answer_call_back()
 
-    with col3:
-        st.write("")
+        with chat_placeholder:
+            for answer in st.session_state.resume_history:
+                if answer.origin == 'ai':
+                    if auto_play and audio:
+                        with st.chat_message("assistant"):
+                            st.write(answer.message)
+                            st.write(audio)
+                    else:
+                        with st.chat_message("assistant"):
+                            st.write(answer.message)
+                else:
+                    with st.chat_message("user"):
+                        st.write(answer.message)
 
-    st.markdown(f"""# {home_title} <span style=color:#2E9BF5><font size=5></font></span>""",unsafe_allow_html=True)
-    st.markdown("""\n""")
-    st.markdown("Welcome to AI Interviewer! Driven by Generative AI, it acts as your personal mock interviewer that focuses on Technical and Behavioral skills. By uploading your resume and job descriptions, you'll receive tailored questions to conduct mock interview.")
-    st.markdown("""\n""")
-    st.markdown("#### Get started!")
-    st.markdown("Select one of the following options to start your interview!")
-    selected = option_menu(
-            menu_title= None,
-            options=["Technical", "Resume", "Behavioral"],
-            icons = ["cast", "cloud-upload", "cast"],
-            default_index=0,
-            orientation="horizontal",
-        )
-    if selected == 'Technical':
-        st.info("""
-            In this session, The AI Interviewer will evaluate your technical abilities with respect to job description.
-                
-            Note: You may only answer with a maximum length of 4097 tokens!
-            - It will take 10 to 15 minutes for each interview.
-            - Refreshing the page will initiate a new session.
-            - Select your preferred mode of communication (voice or chat). 
-            - Begin by introducing yourself and have fun！ """)
-        if st.button("Start Interview!"):
-            switch_page("Technical Interview")
-    if selected == 'Resume':
-        st.info("""
-        In this session, The AI Interviewer will review your resume, assess your abilities based on your previous experiences.
-        
-        Note: You may only answer with a maximum length of 4097 tokens!
-        - It will take 10 to 15 minutes for each interview.
-        - Refreshing the page will initiate a new session.
-        - Select your preferred mode of communication (voice or chat).
-        - Begin by introducing yourself and have fun！ """
-        )
-        if st.button("Start Interview!"):
-            switch_page("Resume based Interview")
-    if selected == 'Behavioral':
-        st.info("""
-        In this session, The AI Interviewer will evaluate your behavioral skills with respect to job description.
-        
-        Note: You may only answer with a maximum length of 4097 tokens!
-        - It will take 10 to 15 minutes for each interview.
-        - Refreshing the page will initiate a new session.
-        - Select your preferred mode of communication (voice or chat).
-        - Begin by introducing yourself and have fun！ 
-        """)
-        if st.button("Start Interview!"):
-            switch_page("Behavioral Interview")
-    st.markdown("""\n""")
-  
+        credit_card_placeholder.caption(f"""
+                        Progress: {int(len(st.session_state.resume_history) / 30 * 100)}% completed.""")
